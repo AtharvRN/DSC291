@@ -79,33 +79,29 @@ class Communicator(object):
           - For non-root processes: one send and one receive.
           - For the root process: (n-1) receives and (n-1) sends.
         """
-        #TODO: Your code here
         rank = self.Get_rank()
         num_procs = self.Get_size()
-        if rank == 0:
 
-            np.copyto(dest_array, src_array) 
-            for i in range(1, num_procs):
-                temp_array = np.empty_like(src_array)
-                self.comm.Recv(temp_array, source=i)
-                if op == MPI.SUM:
-                    dest_array += temp_array
-                elif op == MPI.MIN:
-                    # print(f"Comparing for MIN: current dest_array {dest_array} vs temp_array {temp_array}")
-                    minimum_array = np.minimum(dest_array, temp_array)
-                    np.copyto(dest_array, minimum_array)
-                elif op == MPI.MAX:
-                    # print(f"Comparing for MAX: current dest_array {dest_array} vs temp_array {temp_array}")
-                    maximum_array = np.maximum(dest_array, temp_array)
-                    np.copyto(dest_array, maximum_array)
-                else:
-                    raise NotImplementedError("Only MPI.SUM, MPI.MIN, and MPI.MAX are implemented in myAllreduce.")
-            for i in range(1, num_procs):
-                self.comm.Send(dest_array, dest=i) 
+        if op == MPI.SUM:
+            reduce_fn = np.add
+        elif op == MPI.MIN:
+            reduce_fn = np.minimum
+        elif op == MPI.MAX:
+            reduce_fn = np.maximum
         else:
-            # print(f"I am a non-root process (rank {rank})")
+            raise NotImplementedError("Only MPI.SUM, MPI.MIN, and MPI.MAX are implemented in myAllreduce.")
+
+        if rank == 0:
+            np.copyto(dest_array, src_array)
+            temp_array = np.empty_like(src_array)
+            for i in range(1, num_procs):
+                self.comm.Recv(temp_array, source=i)
+                reduce_fn(dest_array, temp_array, out=dest_array)
+            for i in range(1, num_procs):
+                self.comm.Send(dest_array, dest=i)
+        else:
             self.comm.Send(src_array, dest=0)
-            self.comm.Recv(dest_array, source=0)  # Receive the reduced result from root
+            self.comm.Recv(dest_array, source=0)
         
         # Track bytes transferred
         src_array_byte = src_array.itemsize * src_array.size
@@ -161,5 +157,4 @@ class Communicator(object):
         recv_seg_bytes = dest_array.itemsize * segment_size
         self.total_bytes_transferred += send_seg_bytes * (nprocs - 1)
         self.total_bytes_transferred += recv_seg_bytes * (nprocs - 1)
-
 

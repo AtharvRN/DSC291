@@ -42,4 +42,13 @@ def split_data(
         - Do not shuffle the data indices as shuffling will be done later.
     """
 
-    #TODO: Your code here
+    dp_idx = rank // mp_size
+    mp_idx = rank % mp_size
+    data_num = x_train.shape[0]
+    split_size = data_num // dp_size
+    start_idx = dp_idx * split_size
+    end_idx = (dp_idx + 1) * split_size
+    split_x_train = x_train[start_idx:end_idx]
+    split_y_train = y_train[start_idx:end_idx]
+    return split_x_train, split_y_train
+

@@ -80,6 +80,39 @@ class Communicator(object):
           - For the root process: (n-1) receives and (n-1) sends.
         """
         #TODO: Your code here
+        rank = self.Get_rank()
+        num_procs = self.Get_size()
+        if rank == 0:
+
+            np.copyto(dest_array, src_array) 
+            for i in range(1, num_procs):
+                temp_array = np.empty_like(src_array)
+                self.comm.Recv(temp_array, source=i)
+                if op == MPI.SUM:
+                    dest_array += temp_array
+                elif op == MPI.MIN:
+                    # print(f"Comparing for MIN: current dest_array {dest_array} vs temp_array {temp_array}")
+                    minimum_array = np.minimum(dest_array, temp_array)
+                    np.copyto(dest_array, minimum_array)
+                elif op == MPI.MAX:
+                    # print(f"Comparing for MAX: current dest_array {dest_array} vs temp_array {temp_array}")
+                    maximum_array = np.maximum(dest_array, temp_array)
+                    np.copyto(dest_array, maximum_array)
+                else:
+                    raise NotImplementedError("Only MPI.SUM, MPI.MIN, and MPI.MAX are implemented in myAllreduce.")
+            for i in range(1, num_procs):
+                self.comm.Send(dest_array, dest=i) 
+        else:
+            # print(f"I am a non-root process (rank {rank})")
+            self.comm.Send(src_array, dest=0)
+            self.comm.Recv(dest_array, source=0)  # Receive the reduced result from root
+        
+        # Track bytes transferred
+        src_array_byte = src_array.itemsize * src_array.size
+        if rank == 0:
+            self.total_bytes_transferred += src_array_byte * 2 * (num_procs - 1)
+        else:
+            self.total_bytes_transferred += src_array_byte * 2
 
     def myAlltoall(self, src_array, dest_array):
         """
@@ -99,4 +132,34 @@ class Communicator(object):
             
         The total data transferred is updated for each pairwise exchange.
         """
-        #TODO: Your code here
+        nprocs = self.comm.Get_size()
+        rank = self.Get_rank()
+
+        array_size = src_array.size
+        assert array_size % nprocs == 0, "src_array size must be divisible by the number of processes"
+        assert dest_array.size == array_size, "dest_array must be the same size as src_array"
+
+        segment_size = array_size // nprocs
+        for i in range(nprocs):
+            send_start = i * segment_size
+            send_end = (i + 1) * segment_size
+            recv_start = i * segment_size
+            recv_end = (i + 1) * segment_size
+
+            if i == rank:
+                # Local copy for the segment that belongs to this process
+                dest_array[recv_start:recv_end] = src_array[send_start:send_end]
+            else:
+                # Sendrecv for segments that belong to other processes
+                self.comm.Sendrecv(
+                    src_array[send_start:send_end], dest=i,
+                    recvbuf=dest_array[recv_start:recv_end], source=i
+                )
+        
+        # Track bytes transferred
+        send_seg_bytes = src_array.itemsize * segment_size
+        recv_seg_bytes = dest_array.itemsize * segment_size
+        self.total_bytes_transferred += send_seg_bytes * (nprocs - 1)
+        self.total_bytes_transferred += recv_seg_bytes * (nprocs - 1)
+
+

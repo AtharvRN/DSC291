@@ -58,7 +58,20 @@ def get_info(
     part_out_dim : int
         The partitioned output dimension for the FC layer.
     """
-    #TODO: Your code here
+    mp_idx = rank % mp_size
+    dp_idx = rank // mp_size
+    mp_comm = comm.Split(color=dp_idx, key=rank)
+    dp_comm = comm.Split(color=mp_idx, key=rank)
+
+    if fc_layer in ("fc_q", "fc_k", "fc_v"):
+        part_in_dim = in_dim
+        part_out_dim = out_dim // mp_size
+    elif fc_layer == "fc_o":
+        part_in_dim = in_dim // mp_size
+        part_out_dim = out_dim
+    else:
+        raise ValueError(f"Unknown fully-connected layer: {fc_layer}")
+
     return mp_idx, dp_idx, mp_comm, dp_comm, part_in_dim, part_out_dim
 
 def naive_collect_forward_input(
@@ -74,7 +87,10 @@ def naive_collect_forward_input(
     After gathering, the full input should have shape:
       (batch_size, seq_length, part_in_dim * mp_size)
     """
-    #TODO: Your code here
+    local_x = np.ascontiguousarray(x)
+    gathered_x = np.empty((mp_size,) + local_x.shape, dtype=local_x.dtype)
+    mp_comm.Allgather(local_x, gathered_x)
+    collected_x = np.concatenate([gathered_x[i] for i in range(mp_size)], axis=-1)
     return collected_x
 
 
@@ -94,7 +110,8 @@ def naive_collect_forward_output(
     the same shape:
       (batch_size, seq_length, out_dim)
     """
-    #TODO: Your code here
+    collected_out = np.empty_like(out)
+    mp_comm.Allreduce(out, collected_out, op=MPI.SUM)
     return collected_out
 
 def naive_collect_backward_output(
@@ -127,7 +144,10 @@ def naive_collect_backward_output(
         The local output gradient for this MP node with shape 
         (batch_size, seq_length, out_dim // mp_size).
     """
-    #TODO: Your code here
+    part_out_dim = output_grad.shape[-1] // mp_size
+    start_idx = mp_group_idx * part_out_dim
+    end_idx = (mp_group_idx + 1) * part_out_dim
+    return output_grad[..., start_idx:end_idx]
 
 
 def naive_collect_backward_x(
@@ -162,4 +182,18 @@ def naive_collect_backward_x(
         The reduced and scattered grad_x with shape 
         (batch_size, seq_length, in_dim // mp_size).
     """
-    #TODO: Your code here
+    grad_x = np.ascontiguousarray(grad_x)
+    grad_x_parts = np.split(grad_x, mp_size, axis=-1)
+    part_shape = grad_x_parts[0].shape
+
+    sendbuf = np.concatenate(
+        [np.ascontiguousarray(part).reshape(-1) for part in grad_x_parts]
+    )
+    recvbuf = np.empty(np.prod(part_shape), dtype=grad_x.dtype)
+
+    if hasattr(mp_comm, "Reduce_scatter_block"):
+        mp_comm.Reduce_scatter_block(sendbuf, recvbuf, op=MPI.SUM)
+    else:
+        mp_comm.Reduce_scatter(sendbuf, recvbuf, op=MPI.SUM)
+
+    return recvbuf.reshape(part_shape)

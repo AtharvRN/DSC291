@@ -1,1 +1,9 @@
-Put discussion here for 2.1
+myAllreduce
+Implementation: We implemented myAllreduce with recursive doubling for power-of-two process counts, where each rank exchanges its current partial reduction with a rank selected by rank ^ mask using Sendrecv. This avoids the serialized rank-0 bottleneck of a reduce-to-root followed by broadcast.
+
+Results: On the default 8-rank assignment test over 100 runs, myAllreduce averaged about 0.000501 s versus 0.000602 s for MPI.Allreduce. This benchmark is noisy because it uses very small buffers and an oversubscribed local run, so the exact gap can vary between runs. It is only a simple wall-clock average from the default test script, not a standard MPI performance metric; a standard evaluation would report latency/bandwidth over many message sizes, often with medians or percentiles on dedicated hardware.
+
+myAlltoall
+Implementation: We implemented myAlltoall by directly copying the local self-segment, then posting nonblocking point-to-point receives and sends for the remaining one-value peer segments before waiting for all requests to finish. This reduces serialization compared with doing one blocking exchange at a time.
+
+Results: On the default 8-rank assignment test over 100 runs, myAlltoall averaged about 0.000071 s versus 0.000114 s for MPI.Alltoall in the latest run. We observed noticeable run-to-run noise for this small-message benchmark, including cases where the relative ordering changes. These timings are useful for the assignment comparison, but they are not standard all-to-all performance metrics because they use one small message size on an oversubscribed local run rather than a full latency/bandwidth sweep.

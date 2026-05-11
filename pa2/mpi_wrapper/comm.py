@@ -82,6 +82,7 @@ class Communicator(object):
         rank = self.Get_rank()
         num_procs = self.Get_size()
 
+        # Map the MPI reduction operator to the matching NumPy elementwise op.
         if op == MPI.SUM:
             reduce_fn = np.add
         elif op == MPI.MIN:
@@ -91,8 +92,31 @@ class Communicator(object):
         else:
             raise NotImplementedError("Only MPI.SUM, MPI.MIN, and MPI.MAX are implemented in myAllreduce.")
 
-        if rank == 0:
-            np.copyto(dest_array, src_array)
+        # Start with this rank's local contribution as the partial reduction.
+        # After the communication rounds, dest_array will contain the full result.
+        np.copyto(dest_array, src_array)
+
+        # Recursive doubling works directly when the communicator size is a
+        # power of two. Each round doubles the number of ranks included in
+        # dest_array's partial reduction.
+        if num_procs & (num_procs - 1) == 0:
+            temp_array = np.empty_like(src_array)
+            mask = 1
+            while mask < num_procs:
+                # Flip one bit of rank to pick the partner for this round:
+                # mask=1 pairs (0,1), (2,3), ...
+                # mask=2 pairs (0,2), (1,3), ...
+                # mask=4 pairs (0,4), (1,5), ...
+                peer = rank ^ mask
+                # Send the current partial result and receive the peer's
+                # partial result in one matched point-to-point call.
+                self.comm.Sendrecv(dest_array, dest=peer, recvbuf=temp_array, source=peer)
+                # Merge the peer's partial result into our partial result.
+                reduce_fn(dest_array, temp_array, out=dest_array)
+                mask <<= 1
+        # Fallback for non-power-of-two sizes: reduce everything to rank 0,
+        # then send the final reduced result back out to the other ranks.
+        elif rank == 0:
             temp_array = np.empty_like(src_array)
             for i in range(1, num_procs):
                 self.comm.Recv(temp_array, source=i)
@@ -103,9 +127,12 @@ class Communicator(object):
             self.comm.Send(src_array, dest=0)
             self.comm.Recv(dest_array, source=0)
         
-        # Track bytes transferred
+        # Track bytes transferred by this rank for the chosen algorithm.
         src_array_byte = src_array.itemsize * src_array.size
-        if rank == 0:
+        if num_procs & (num_procs - 1) == 0:
+            # Each recursive-doubling round sends and receives one full buffer.
+            self.total_bytes_transferred += src_array_byte * 2 * (num_procs.bit_length() - 1)
+        elif rank == 0:
             self.total_bytes_transferred += src_array_byte * 2 * (num_procs - 1)
         else:
             self.total_bytes_transferred += src_array_byte * 2
@@ -121,10 +148,10 @@ class Communicator(object):
         It is assumed that the total length of src_array (and dest_array)
         is evenly divisible by the number of processes.
         
-        The algorithm loops over the ranks:
-          - For the local segment (when destination == self), a direct copy is done.
-          - For all other segments, the process exchanges the corresponding
-            portion of its src_array with the other process via Sendrecv.
+        The algorithm loops over destination ranks:
+          - The local segment is copied directly.
+          - For every other destination rank, Sendrecv exchanges the segment
+            intended for that rank with the segment that rank sends back.
             
         The total data transferred is updated for each pairwise exchange.
         """
@@ -136,25 +163,40 @@ class Communicator(object):
         assert dest_array.size == array_size, "dest_array must be the same size as src_array"
 
         segment_size = array_size // nprocs
-        for i in range(nprocs):
-            send_start = i * segment_size
-            send_end = (i + 1) * segment_size
-            recv_start = i * segment_size
-            recv_end = (i + 1) * segment_size
+        if segment_size == 1:
+            # Fast path for the assignment benchmark: each rank sends one value
+            # to every peer. Post all point-to-point operations before waiting.
+            dest_array[rank:rank + 1] = src_array[rank:rank + 1]
+            requests = []
+            for peer in range(nprocs):
+                if peer != rank:
+                    requests.append(self.comm.Irecv(dest_array[peer:peer + 1], source=peer))
+            for peer in range(nprocs):
+                if peer != rank:
+                    requests.append(self.comm.Isend(src_array[peer:peer + 1], dest=peer))
+            MPI.Request.Waitall(requests)
+        else:
+            # General equal-segment path for larger 1-D buffers.
+            for peer in range(nprocs):
+                send_start = peer * segment_size
+                send_end = (peer + 1) * segment_size
+                recv_start = peer * segment_size
+                recv_end = (peer + 1) * segment_size
 
-            if i == rank:
-                # Local copy for the segment that belongs to this process
-                dest_array[recv_start:recv_end] = src_array[send_start:send_end]
-            else:
-                # Sendrecv for segments that belong to other processes
-                self.comm.Sendrecv(
-                    src_array[send_start:send_end], dest=i,
-                    recvbuf=dest_array[recv_start:recv_end], source=i
-                )
+                if peer == rank:
+                    # The segment this rank sends to itself does not need MPI communication.
+                    dest_array[recv_start:recv_end] = src_array[send_start:send_end]
+                else:
+                    # Exchange the segment intended for peer with the segment peer
+                    # prepared for this rank.
+                    self.comm.Sendrecv(
+                        src_array[send_start:send_end], dest=peer,
+                        recvbuf=dest_array[recv_start:recv_end], source=peer
+                    )
         
-        # Track bytes transferred
+        # Track bytes transferred by this rank: one send and one receive for
+        # every remote rank. The local self-copy is not counted as communication.
         send_seg_bytes = src_array.itemsize * segment_size
         recv_seg_bytes = dest_array.itemsize * segment_size
         self.total_bytes_transferred += send_seg_bytes * (nprocs - 1)
         self.total_bytes_transferred += recv_seg_bytes * (nprocs - 1)
-
